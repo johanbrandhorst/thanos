@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"math"
 	"math/rand"
+	"os"
 	"reflect"
 	"strconv"
 	"testing"
@@ -16,11 +17,14 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
@@ -162,62 +166,108 @@ func TestQuerier_DownsampledData(t *testing.T) {
 }
 
 func TestQuerier_Series(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 10*time.Second)()
-
-	testProxy := &storeServer{
-		resps: []*storepb.SeriesResponse{
-			// Expected sorted  series per seriesSet input. However we Series API allows for single series being chunks across multiple frames.
-			// This should be handled here.
-			storeSeriesResponse(t, labels.FromStrings("a", "a"), []sample{{0, 0}, {2, 1}, {3, 2}}),
-			storepb.NewWarnSeriesResponse(errors.New("partial error")),
-			storeSeriesResponse(t, labels.FromStrings("a", "a"), []sample{{5, 5}, {6, 6}, {7, 7}}),
-			storeSeriesResponse(t, labels.FromStrings("a", "a"), []sample{{5, 5}, {6, 66}}), // Overlap samples for some reason.
-			storeSeriesResponse(t, labels.FromStrings("a", "b"), []sample{{2, 2}, {3, 3}, {4, 4}}, []sample{{1, 1}, {2, 2}, {3, 3}}),
-			storeSeriesResponse(t, labels.FromStrings("a", "c"), []sample{{100, 1}, {300, 3}, {400, 4}}),
-		},
-	}
-
-	// Querier clamps the range to [1,300], which should drop some samples of the result above.
-	// The store API allows endpoints to send more data then initially requested.
-	q := newQuerier(context.Background(), nil, 1, 300, []string{""}, testProxy, false, 0, true, false)
-	defer func() { testutil.Ok(t, q.Close()) }()
-
-	res, _, err := q.Select(&storage.SelectParams{})
-	testutil.Ok(t, err)
-
-	expected := []struct {
+	type series struct {
 		lset    labels.Labels
 		samples []sample
+	}
+	for _, tcase := range []struct {
+		name     string
+		storeAPI storepb.StoreServer
+
+		mint, maxt    int64
+		matchers      []*labels.Matcher
+		replicaLabels []string
+		dedup         bool
+		hints         *storage.SelectParams
+
+		expected        []series
+		expectedWarning string
 	}{
 		{
-			lset:    labels.FromStrings("a", "a"),
-			samples: []sample{{2, 1}, {3, 2}, {5, 5}, {6, 6}, {7, 7}},
+			name: "select overlapping data with partial error",
+			storeAPI: &storeServer{
+				resps: []*storepb.SeriesResponse{
+					storeSeriesResponse(t, labels.FromStrings("a", "a"), []sample{{0, 0}, {2, 1}, {3, 2}}),
+					storepb.NewWarnSeriesResponse(errors.New("partial error")),
+					storeSeriesResponse(t, labels.FromStrings("a", "a"), []sample{{5, 5}, {6, 6}, {7, 7}}),
+					storeSeriesResponse(t, labels.FromStrings("a", "a"), []sample{{5, 5}, {6, 66}}), // Overlap samples for some reason.
+					storeSeriesResponse(t, labels.FromStrings("a", "b"), []sample{{2, 2}, {3, 3}, {4, 4}}, []sample{{1, 1}, {2, 2}, {3, 3}}),
+					storeSeriesResponse(t, labels.FromStrings("a", "c"), []sample{{100, 1}, {300, 3}, {400, 4}}),
+				},
+			},
+			mint: 1, maxt: 300,
+			expected: []series{
+				{
+					lset:    labels.FromStrings("a", "a"),
+					samples: []sample{{2, 1}, {3, 2}, {5, 5}, {6, 6}, {7, 7}},
+				},
+				{
+					lset:    labels.FromStrings("a", "b"),
+					samples: []sample{{1, 1}, {2, 2}, {3, 3}, {4, 4}},
+				},
+				{
+					lset:    labels.FromStrings("a", "c"),
+					samples: []sample{{100, 1}, {300, 3}},
+				},
+			},
+			expectedWarning: "partial error",
 		},
 		{
-			lset:    labels.FromStrings("a", "b"),
-			samples: []sample{{1, 1}, {2, 2}, {3, 3}, {4, 4}},
+			// Regression test against https://github.com/thanos-io/thanos/issues/2401.
+			name: "overlapping chunks",
+			storeAPI: func() storepb.StoreServer {
+				s, err := store.NewDebugLocalJSONStore(log.NewLogfmtLogger(os.Stderr), component.Debug, nil, "./testdata/issue2401-seriesresponses.json", store.GRPCCurlSplit)
+				testutil.Ok(t, err)
+				return s
+			}(),
+			mint: 1582329611249, maxt: 1582415996245,
+			matchers: []*labels.Matcher{{
+				Value: "gitlab_transaction_cache_read_hit_count_total",
+				Name:  "__name__",
+				Type:  labels.MatchEqual,
+			}},
+			expected: []series{
+				{
+					lset:    labels.FromStrings("a", "a"),
+					samples: []sample{{2, 1}, {3, 2}, {5, 5}, {6, 6}, {7, 7}},
+				},
+				{
+					lset:    labels.FromStrings("a", "b"),
+					samples: []sample{{1, 1}, {2, 2}, {3, 3}, {4, 4}},
+				},
+				{
+					lset:    labels.FromStrings("a", "c"),
+					samples: []sample{{100, 1}, {300, 3}},
+				},
+			},
 		},
-		{
-			lset: labels.FromStrings("a", "c"),
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-			samples: []sample{{100, 1}, {300, 3}},
-		},
+			q := newQuerier(context.Background(), nil, tcase.mint, tcase.maxt, tcase.replicaLabels, tcase.storeAPI, tcase.dedup, 0, true, false)
+			defer func() { testutil.Ok(t, q.Close()) }()
+
+			res, w, err := q.Select(tcase.hints, tcase.matchers...)
+			testutil.Ok(t, err)
+			if tcase.expectedWarning != "" {
+				testutil.Equals(t, 1, len(w))
+				testutil.Equals(t, tcase.expectedWarning, w[0].Error())
+			}
+
+			i := 0
+			for res.Next() {
+				testutil.Assert(t, i < len(tcase.expected), "more series than expected")
+				testutil.Equals(t, tcase.expected[i].lset, res.At().Labels())
+
+				samples := expandSeries(t, res.At().Iterator())
+				testutil.Equals(t, tcase.expected[i].samples, samples)
+				i++
+			}
+			testutil.Ok(t, res.Err())
+			testutil.Equals(t, len(tcase.expected), i)
+		})
 	}
-
-	i := 0
-	for res.Next() {
-		testutil.Assert(t, i < len(expected), "more series than expected")
-
-		testutil.Equals(t, expected[i].lset, res.At().Labels())
-
-		samples := expandSeries(t, res.At().Iterator())
-		testutil.Equals(t, expected[i].samples, samples)
-
-		i++
-	}
-	testutil.Ok(t, res.Err())
-
-	testutil.Equals(t, len(expected), i)
 }
 
 func TestSortReplicaLabel(t *testing.T) {
