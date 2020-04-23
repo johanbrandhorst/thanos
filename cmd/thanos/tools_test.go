@@ -10,17 +10,17 @@ import (
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
-func Test_checkRules(t *testing.T) {
+func Test_CheckRules(t *testing.T) {
 
 	validFiles := []string{
 		"./testdata/rules-files/valid.yaml",
 	}
 
 	invalidFiles := [][]string{
-		[]string{"./testdata/rules-files/non-existing-file.yaml"},
-		[]string{"./testdata/rules-files/invalid-yaml-format.yaml"},
-		[]string{"./testdata/rules-files/invalid-rules-data.yaml"},
-		[]string{"./testdata/rules-files/invalid-unknown-field.yaml"},
+		{"./testdata/rules-files/non-existing-file.yaml"},
+		{"./testdata/rules-files/invalid-yaml-format.yaml"},
+		{"./testdata/rules-files/invalid-rules-data.yaml"},
+		{"./testdata/rules-files/invalid-unknown-field.yaml"},
 	}
 
 	logger := log.NewNopLogger()
