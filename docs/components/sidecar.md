@@ -6,7 +6,7 @@ menu: components
 
 # Sidecar
 
-The sidecar component of Thanos gets deployed along with a Prometheus instance. This allows sidecar to optionally upload metrics to object storage and allow [Queriers](./query.md) to query Prometheus data with common, efficient StoreAPI.
+The `thanos sidecar` component of Thanos gets deployed along with a Prometheus instance. This allows sidecar to optionally upload metrics to object storage and allow [Queriers](./query.md) to query Prometheus data with common, efficient StoreAPI.
 
 In details:
 
@@ -55,7 +55,7 @@ $ prometheus \
   --web.enable-lifecycle
 ```
 
-```bash
+```bashas
 $ thanos sidecar \
     --tsdb.path        "/path/to/prometheus/data/dir" \
     --prometheus.url   "http://localhost:9090" \

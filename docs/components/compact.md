@@ -6,7 +6,7 @@ menu: components
 
 # Compactor
 
-The compactor component of Thanos applies the compaction procedure of the Prometheus 2.0 storage engine to block data stored in object storage.
+The `thanos compact` component of Thanos applies the compaction procedure of the Prometheus 2.0 storage engine to block data stored in object storage.
 It is generally not semantically concurrency safe and must be deployed as a singleton against a bucket.
 
 It is also responsible for downsampling of data:
